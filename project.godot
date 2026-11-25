@@ -1,0 +1,43 @@
+; Engine configuration file.
+; Neon Strike: Asalto Galáctico
+
+config_version=5
+
+[application]
+
+config/name="Neon Strike: Asalto Galáctico"
+config/description="Shooter 2D de campaña y supervivencia por rondas."
+config/version="1.0.0"
+run/main_scene="res://scenes/main_menu.tscn"
+config/features=PackedStringArray("4.3", "GL Compatibility")
+boot_splash/bg_color=Color(0.02, 0.02, 0.08, 1)
+boot_splash/image="res://assets/splash.png"
+boot_splash/fullsize=true
+boot_splash/use_filter=true
+config/icon="res://assets/icon.png"
+config/windows_native_icon="res://assets/icon.ico"
+
+[autoload]
+
+Sfx="*res://scripts/autoload/sfx.gd"
+Game="*res://scripts/autoload/game.gd"
+
+[display]
+
+window/size/viewport_width=1280
+window/size/viewport_height=720
+window/stretch/mode="canvas_items"
+window/stretch/aspect="expand"
+window/handheld/orientation=0
+
+[input_devices]
+
+pointing/emulate_touch_from_mouse=false
+pointing/emulate_mouse_from_touch=true
+
+[rendering]
+
+renderer/rendering_method="gl_compatibility"
+renderer/rendering_method.mobile="gl_compatibility"
+textures/vram_compression/import_etc2_astc=true
+environment/defaults/default_clear_color=Color(0.02, 0.02, 0.06, 1)

@@ -1,0 +1,1150 @@
+extends Node2D
+## Controlador principal de partida: Campaña por sectores y Supervivencia por rondas,
+## oleadas, colisiones, cartas tácticas roguelite, HUD, radar, pausa, victoria y derrota.
+
+const UI = preload("res://scripts/ui.gd")
+const Background = preload("res://scripts/background.gd")
+const OptionsPanel = preload("res://scripts/options_panel.gd")
+const PlayerScript = preload("res://scripts/game/player.gd")
+const BulletScript = preload("res://scripts/game/bullet.gd")
+const EnemyScript = preload("res://scripts/game/enemy.gd")
+const BossScript = preload("res://scripts/game/boss.gd")
+const PickupScript = preload("res://scripts/game/pickup.gd")
+const FXScript = preload("res://scripts/game/fx.gd")
+const TouchControlsScript = preload("res://scripts/game/touch_controls.gd")
+
+var arena := Rect2(0, 0, 2200, 1400)
+var theme_color := Color("4df0ff")
+
+var cam: Camera2D
+var bg: Node2D
+var player: Node2D
+var fx: Node2D
+var touch_controls: Control
+var bullet_root: Node2D
+var enemy_root: Node2D
+var pickup_root: Node2D
+
+var bullets: Array = []
+var enemies: Array = []
+var pickups: Array = []
+var portals: Array = []
+var boss: Node2D = null
+
+var score := 0
+var credits_earned := 0
+var kills := 0
+var combo := 1
+var combo_timer := 0.0
+var shake := 0.0
+var match_ended := false
+var choosing_card := false
+var took_damage_this_sector := false
+
+var wave := 0
+var max_waves := 4
+var wave_pause := 0.0
+var wave_active := false
+var spawn_queue: Array = []
+var spawn_cd := 0.0
+var wave_total_enemies := 1
+var wave_killed_enemies := 0
+var boss_spawned := false
+
+# HUD
+var hud_layer: CanvasLayer
+var hp_bar: ColorRect
+var hp_lbl: Label
+var sh_bar: ColorRect
+var sh_lbl: Label
+var bomb_lbl: Label
+var dash_lbl: Label
+var power_lbl: Label
+var sector_lbl: Label
+var wave_lbl: Label
+var boss_box: Control
+var boss_name_lbl: Label
+var boss_bar: ColorRect
+var score_lbl: Label
+var combo_lbl: Label
+var credits_lbl: Label
+var fps_lbl: Label
+var banner_lbl: Label
+var hotbar_btns: Array = []
+var radar_ctrl: Control
+var flash_rect: ColorRect
+var overlay_root: CenterContainer
+var pause_panel: Control
+
+
+func _ready() -> void:
+	Game.data.stats.games = int(Game.data.stats.games) + 1
+	if Game.mode == "campaign":
+		var lvl: Dictionary = Game.LEVELS[Game.current_level]
+		theme_color = lvl.color
+		max_waves = int(lvl.waves)
+	else:
+		theme_color = Color("ff4df0")
+		max_waves = 9999
+
+	Sfx.play_music("battle")
+
+	bg = Background.new()
+	bg.menu_mode = false
+	bg.area = arena
+	bg.theme_color = theme_color
+	add_child(bg)
+
+	pickup_root = Node2D.new()
+	add_child(pickup_root)
+	enemy_root = Node2D.new()
+	add_child(enemy_root)
+	bullet_root = Node2D.new()
+	add_child(bullet_root)
+
+	player = PlayerScript.new()
+	player.position = arena.get_center()
+	player.setup(self)
+	add_child(player)
+
+	fx = FXScript.new()
+	fx.z_index = 10
+	add_child(fx)
+
+	cam = Camera2D.new()
+	cam.position = player.position
+	add_child(cam)
+	cam.make_current()
+
+	_build_hud()
+
+	if Game.mode == "campaign":
+		var lvl: Dictionary = Game.LEVELS[Game.current_level]
+		_show_banner("SECTOR 0%d: %s" % [Game.current_level + 1, String(lvl.name).to_upper()], theme_color)
+	else:
+		_show_banner("MODO SUPERVIVENCIA — ¡RESISTE!", theme_color)
+
+	wave_pause = 1.4
+
+
+func _process(delta: float) -> void:
+	if fps_lbl:
+		fps_lbl.visible = bool(Game.settings.show_fps)
+		if fps_lbl.visible:
+			fps_lbl.text = "%d FPS" % Engine.get_frames_per_second()
+
+	if get_tree().paused or match_ended:
+		return
+
+	Game.data.stats.playtime = float(Game.data.stats.playtime) + delta
+
+	if combo > 1:
+		combo_timer -= delta
+		if combo_timer <= 0.0:
+			combo = 1
+
+	if is_instance_valid(player):
+		player.step(delta)
+
+	_step_portals(delta)
+	_step_spawner(delta)
+	_step_bullets(delta)
+	_step_enemies(delta)
+	_step_pickups(delta)
+	_step_camera(delta)
+	_update_hud()
+	if radar_ctrl:
+		radar_ctrl.queue_redraw()
+	queue_redraw()
+
+
+func _unhandled_input(event: InputEvent) -> void:
+	if event.is_action_pressed("pause") and not match_ended and not choosing_card:
+		get_viewport().set_input_as_handled()
+		_toggle_pause()
+
+
+# ---------------------------------------------------------------- Gestión de oleadas
+func _step_spawner(delta: float) -> void:
+	if not spawn_queue.is_empty():
+		spawn_cd -= delta
+		if spawn_cd <= 0.0 and enemies.size() + portals.size() < 26:
+			var next_kind: String = spawn_queue.pop_front()
+			_queue_portal(next_kind)
+			spawn_cd = randf_range(0.22, 0.52)
+		return
+
+	if not portals.is_empty() or not enemies.is_empty() or is_instance_valid(boss):
+		return
+
+	if wave_pause > 0.0:
+		wave_pause -= delta
+		if wave_pause > 0.0:
+			return
+
+	# Comprobar si toca jefe o victoria en campaña
+	if Game.mode == "campaign":
+		var lvl: Dictionary = Game.LEVELS[Game.current_level]
+		if wave >= max_waves:
+			if String(lvl.boss) != "" and not boss_spawned:
+				_spawn_boss(String(lvl.boss), 1.0)
+				return
+			_on_campaign_victory()
+			return
+
+	# Ofrecer carta táctica entre oleadas/rondas
+	if wave > 0 and (Game.mode == "survival" or wave % 2 == 0):
+		if not _card_offered_for_wave:
+			_card_offered_for_wave = true
+			_open_card_selection()
+			return
+
+	_start_next_wave()
+
+
+var _card_offered_for_wave := false
+
+
+func _start_next_wave() -> void:
+	_card_offered_for_wave = false
+	wave_active = true
+	wave += 1
+	Sfx.play("wave")
+
+	if Game.mode == "survival":
+		if wave > int(Game.data.stats.best_round):
+			Game.data.stats.best_round = wave
+		if wave >= 10:
+			Game.unlock_achievement("survivor10")
+		if wave >= 25:
+			Game.unlock_achievement("survivor25")
+		if wave % 3 == 0:
+			spawn_pickup(player.position + Vector2(0, -90), "ammo")
+
+		if wave % 5 == 0:
+			var bosses := ["coloso", "reina", "omega"]
+			var bkind: String = bosses[((wave / 5) - 1) % bosses.size()]
+			var bscale := 1.0 + (wave - 5) * 0.14
+			_spawn_boss(bkind, bscale)
+			return
+
+	var pool: Array
+	var budget: float
+	if Game.mode == "campaign":
+		var lvl: Dictionary = Game.LEVELS[Game.current_level]
+		pool = lvl.pool
+		budget = float(lvl.budget) + (wave - 1) * float(lvl.growth)
+		_show_banner("OLEADA %d / %d" % [wave, max_waves], theme_color)
+	else:
+		pool = ["drone", "shooter"]
+		if wave >= 2:
+			pool.append("kamikaze")
+		if wave >= 3:
+			pool.append("tank")
+		if wave >= 4:
+			pool.append("splitter")
+		if wave >= 6:
+			pool.append("sniper")
+		budget = 8.0 + wave * 3.8
+		_show_banner("RONDA %d" % wave, theme_color)
+
+	spawn_queue.clear()
+	while budget > 0.0:
+		var k: String = pool[randi() % pool.size()]
+		spawn_queue.append(k)
+		budget -= float(Game.ENEMY_COST.get(k, 1.5))
+
+	wave_total_enemies = maxi(1, spawn_queue.size())
+	wave_killed_enemies = 0
+	spawn_cd = 0.25
+
+
+func _queue_portal(kind: String) -> void:
+	var pos := arena.get_center()
+	var margin := arena.grow(-90.0)
+	for attempt in 12:
+		var candidate := Vector2(
+			randf_range(margin.position.x, margin.end.x),
+			randf_range(margin.position.y, margin.end.y)
+		)
+		if not is_instance_valid(player) or candidate.distance_to(player.position) > 290.0:
+			pos = candidate
+			break
+	portals.append({"p": pos, "k": kind, "t": 0.85, "m": 0.85})
+
+
+func _step_portals(delta: float) -> void:
+	for pt in portals:
+		pt.t -= delta
+		if pt.t <= 0.0:
+			var sc := 1.0 if Game.mode == "campaign" else (1.0 + (wave - 1) * 0.09)
+			spawn_enemy(String(pt.k), pt.p, sc)
+	portals = portals.filter(func(pt): return pt.t > 0.0)
+
+
+func spawn_enemy(kind: String, pos: Vector2, scale_mult: float = 1.0) -> Node2D:
+	var e := EnemyScript.new()
+	e.position = pos
+	e.setup(self, kind, scale_mult)
+	enemy_root.add_child(e)
+	enemies.append(e)
+	fx.add_ring(pos, e.color, 36.0, 0.25, 2.5)
+	return e
+
+
+func _spawn_boss(kind: String, scale_mult: float) -> void:
+	boss_spawned = true
+	wave_active = true
+	Sfx.play("boss_warn")
+	Sfx.play_music("boss")
+	var b := BossScript.new()
+	b.position = arena.get_center() + Vector2(0, -260)
+	b.setup(self, kind, scale_mult)
+	enemy_root.add_child(b)
+	boss = b
+	fx.add_ring(b.position, b.color, 180.0, 0.6, 5.0)
+	add_shake(12.0)
+	_show_banner("¡ALERTA: %s!" % b.boss_name, b.color)
+
+
+# ---------------------------------------------------------------- Proyectiles y colisiones
+func spawn_bullet(pos: Vector2, vel: Vector2, dmg: float, color: Color, radius: float, life: float, is_enemy: bool, pierce: int = 0, explosive: float = 0.0, homing: float = 0.0, crit: bool = false) -> void:
+	var b := BulletScript.new()
+	b.game = self
+	b.position = pos
+	b.prev_pos = pos
+	b.vel = vel
+	b.dmg = dmg
+	b.color = color
+	b.radius = radius
+	b.life = life
+	b.is_enemy = is_enemy
+	b.pierce = pierce
+	b.explosive = explosive
+	b.homing = homing
+	b.crit = crit
+	bullet_root.add_child(b)
+	bullets.append(b)
+
+
+func fire_railgun(origin: Vector2, angle: float, dmg: float, color: Color, is_crit: bool) -> void:
+	var dir := Vector2.RIGHT.rotated(angle)
+	var end_pt := origin + dir * 1350.0
+	fx.add_beam(origin, end_pt, color, 11.0, 0.3)
+	for e in enemies.duplicate():
+		if is_instance_valid(e) and _segment_circle(origin, end_pt, e.position, e.radius + 10.0):
+			e.take_damage(dmg, is_crit)
+			fx.add_burst(e.position, color, 10, 220.0, 3.5, 0.35)
+	if is_instance_valid(boss) and _segment_circle(origin, end_pt, boss.position, boss.radius + 12.0):
+		boss.take_damage(dmg, is_crit)
+		fx.add_burst(boss.position, color, 14, 240.0, 4.0, 0.35)
+
+
+func _segment_circle(a: Vector2, b: Vector2, c: Vector2, r: float) -> bool:
+	var ab := b - a
+	var t := clampf((c - a).dot(ab) / maxf(ab.length_squared(), 0.001), 0.0, 1.0)
+	var closest := a + ab * t
+	return closest.distance_squared_to(c) <= r * r
+
+
+func _step_bullets(delta: float) -> void:
+	var alive: Array = []
+	for b in bullets:
+		if not is_instance_valid(b):
+			continue
+		if not b.step(delta):
+			b.queue_free()
+			continue
+
+		var remove := false
+		if b.is_enemy:
+			if is_instance_valid(player) and _segment_circle(b.prev_pos, b.position, player.position, player.radius + b.radius * 0.7):
+				player.take_damage(b.dmg)
+				remove = true
+		else:
+			for e in enemies:
+				if not is_instance_valid(e) or e.hp <= 0.0 or b.hit_list.has(e):
+					continue
+				if _segment_circle(b.prev_pos, b.position, e.position, e.radius + b.radius):
+					b.hit_list.append(e)
+					if b.explosive > 0.0:
+						damage_area(b.position, b.explosive, b.dmg, b.color, b.crit)
+						remove = true
+						break
+					else:
+						e.take_damage(b.dmg, b.crit)
+						fx.add_burst(b.position, b.color, 6, 170.0, 2.8, 0.22)
+						if b.pierce > 0:
+							b.pierce -= 1
+						else:
+							remove = true
+							break
+
+			if not remove and is_instance_valid(boss) and boss.hp > 0.0 and not b.hit_list.has(boss):
+				if _segment_circle(b.prev_pos, b.position, boss.position, boss.radius + b.radius):
+					b.hit_list.append(boss)
+					if b.explosive > 0.0:
+						damage_area(b.position, b.explosive, b.dmg, b.color, b.crit)
+						remove = true
+					else:
+						boss.take_damage(b.dmg, b.crit)
+						fx.add_burst(b.position, b.color, 7, 180.0, 3.0, 0.25)
+						if b.pierce > 0:
+							b.pierce -= 1
+						else:
+							remove = true
+
+		if remove:
+			b.queue_free()
+		else:
+			alive.append(b)
+	bullets = alive
+
+
+func damage_area(pos: Vector2, rad: float, dmg: float, color: Color, is_crit: bool = false) -> void:
+	Sfx.play("explosion")
+	add_shake(7.0)
+	fx.add_ring(pos, color, rad, 0.35, 4.5)
+	fx.add_burst(pos, color, 22, 320.0, 4.2, 0.5)
+	for e in enemies.duplicate():
+		if is_instance_valid(e) and e.position.distance_to(pos) <= rad + e.radius:
+			e.take_damage(dmg, is_crit)
+	if is_instance_valid(boss) and boss.position.distance_to(pos) <= rad + boss.radius:
+		boss.take_damage(dmg, is_crit)
+
+
+func trigger_emp_bomb(pos: Vector2) -> void:
+	Sfx.play("bomb")
+	add_shake(18.0)
+	_flash_screen(Color(0.3, 0.94, 1.0, 0.45))
+	fx.add_ring(pos, Color("4df0ff"), 850.0, 0.65, 8.0)
+	fx.add_ring(pos, Color("ff4df0"), 600.0, 0.5, 5.0)
+	for b in bullets:
+		if is_instance_valid(b) and b.is_enemy:
+			fx.add_burst(b.position, b.color, 4, 120.0, 2.5, 0.25)
+			b.queue_free()
+	bullets = bullets.filter(func(b): return is_instance_valid(b) and not b.is_enemy)
+
+	for e in enemies.duplicate():
+		if is_instance_valid(e):
+			e.take_damage(220.0, true)
+	if is_instance_valid(boss):
+		boss.take_damage(260.0, true)
+
+
+func find_nearest_hostile(pos: Vector2, max_dist: float) -> Node2D:
+	var best: Node2D = null
+	var best_d := max_dist
+	for e in enemies:
+		if is_instance_valid(e) and e.hp > 0.0:
+			var d := pos.distance_to(e.position)
+			if d < best_d:
+				best_d = d
+				best = e
+	if is_instance_valid(boss) and boss.hp > 0.0:
+		var d := pos.distance_to(boss.position)
+		if d < best_d:
+			best = boss
+	return best
+
+
+# ---------------------------------------------------------------- Enemigos, bajas y botín
+func _step_enemies(delta: float) -> void:
+	var alive: Array = []
+	for e in enemies:
+		if not is_instance_valid(e):
+			continue
+		if e.step(delta):
+			alive.append(e)
+		else:
+			e.queue_free()
+	enemies = alive
+
+	if is_instance_valid(boss):
+		if not boss.step(delta):
+			boss.queue_free()
+			boss = null
+
+	if wave_active and spawn_queue.is_empty() and portals.is_empty() and enemies.is_empty() and not is_instance_valid(boss):
+		wave_active = false
+		Sfx.play("wave_clear")
+		if Game.mode == "survival":
+			_show_banner("¡RONDA %d SUPERADA!" % wave, Color("4dff88"))
+		else:
+			_show_banner("¡OLEADA %d COMPLETADA!" % wave, Color("4dff88"))
+		wave_pause = 1.1
+
+
+func on_enemy_killed(e: Node2D) -> void:
+	Sfx.play("explosion", -4.0)
+	fx.add_burst(e.position, e.color, 18, 280.0, 3.8, 0.5)
+	fx.add_ring(e.position, e.color, e.radius * 2.2, 0.28, 3.0)
+	add_shake(3.0)
+
+	kills += 1
+	wave_killed_enemies += 1
+	Game.data.stats.kills = int(Game.data.stats.kills) + 1
+	if int(Game.data.stats.kills) >= 1:
+		Game.unlock_achievement("first_blood")
+	if int(Game.data.stats.kills) >= 1000:
+		Game.unlock_achievement("exterminator")
+
+	if is_instance_valid(player):
+		player.on_kill()
+
+	combo = mini(8, combo + 1)
+	combo_timer = 4.2
+	if combo >= 8:
+		Game.unlock_achievement("combo")
+
+	var d := Game.difficulty()
+	var pts := int(round(float(e.score_val) * combo * float(d.score)))
+	score += pts
+
+	if e.kind == "splitter":
+		for i in 2:
+			var off := Vector2(randf_range(-24, 24), randf_range(-24, 24))
+			spawn_enemy("mini", e.position + off)
+			wave_total_enemies += 1
+
+	# Botín
+	if randf() < 0.72:
+		var cr := int(round(float(e.credit_val) * float(d.credits)))
+		spawn_pickup(e.position, "credit", cr)
+	var roll := randf()
+	if roll < 0.07:
+		spawn_pickup(e.position + Vector2(12, 0), "hp")
+	elif roll < 0.14:
+		spawn_pickup(e.position + Vector2(12, 0), "ammo")
+	elif roll < 0.18:
+		spawn_pickup(e.position + Vector2(12, 0), "power")
+	elif roll < 0.195:
+		spawn_pickup(e.position + Vector2(12, 0), "bomb")
+
+
+func on_boss_killed(b: Node2D) -> void:
+	Sfx.play("big_explosion")
+	Sfx.play_music("battle")
+	add_shake(22.0)
+	_flash_screen(Color(1, 1, 1, 0.55))
+	fx.add_ring(b.position, b.color, 360.0, 0.8, 8.0)
+	fx.add_burst(b.position, b.color, 65, 460.0, 5.5, 0.95)
+
+	Game.data.stats.bosses = int(Game.data.stats.bosses) + 1
+	if b.kind == "coloso":
+		Game.unlock_achievement("boss1")
+	elif b.kind == "reina":
+		Game.unlock_achievement("boss2")
+	elif b.kind == "omega":
+		Game.unlock_achievement("boss3")
+
+	var d := Game.difficulty()
+	score += int(round(2500.0 * float(d.score)))
+	for i in 12:
+		var off := Vector2.RIGHT.rotated(i * TAU / 12.0) * randf_range(25.0, 85.0)
+		spawn_pickup(b.position + off, "credit", int(round(35.0 * float(d.credits))))
+	spawn_pickup(b.position, "hp")
+	spawn_pickup(b.position + Vector2(30, 0), "ammo")
+	wave_pause = 2.0
+
+
+func spawn_pickup(pos: Vector2, kind: String, val: int = 15) -> void:
+	var pk := PickupScript.new()
+	pk.game = self
+	pk.position = pos
+	pk.kind = kind
+	pk.value = val
+	if kind == "power":
+		var types := ["rapid", "damage", "shield", "speed", "invuln"]
+		pk.subkind = types[randi() % types.size()]
+	pickup_root.add_child(pk)
+	pickups.append(pk)
+
+
+func _step_pickups(delta: float) -> void:
+	var alive: Array = []
+	for pk in pickups:
+		if not is_instance_valid(pk):
+			continue
+		if pk.step(delta):
+			alive.append(pk)
+		else:
+			pk.queue_free()
+	pickups = alive
+
+
+func collect_pickup(pk: Node2D) -> void:
+	match pk.kind:
+		"credit":
+			Sfx.play("coin")
+			credits_earned += pk.value
+			Game.add_credits(pk.value)
+			fx.add_text(pk.position, "+%d CR" % pk.value, Color("ffd24d"), 16)
+		"hp":
+			Sfx.play("pickup")
+			player.heal(30.0)
+			fx.add_text(pk.position, "+30 VIDA", Color("4dff88"), 18)
+		"ammo":
+			Sfx.play("pickup")
+			if Game.mode == "survival" and player.temp_weapons.size() < Game.WEAPONS.size() - 1:
+				for w in Game.WEAPONS:
+					if not Game.data.weapons.has(w.id) and not player.temp_weapons.has(w.id):
+						player.temp_weapons.append(w.id)
+						fx.add_text(pk.position + Vector2(0, -22), "¡ARMA: %s!" % String(w.name).to_upper(), w.color, 20)
+						break
+			player.refill_ammo(0.45)
+			fx.add_text(pk.position, "+MUNICIÓN", Color("4df0ff"), 18)
+		"bomb":
+			Sfx.play("powerup")
+			player.bombs += 1
+			fx.add_text(pk.position, "+1 BOMBA EMP", Color("ff4df0"), 19)
+		"power":
+			Sfx.play("powerup")
+			var sk: String = pk.subkind
+			if sk == "shield":
+				player.max_shield = maxf(player.max_shield, 50.0)
+				player.shield = minf(player.max_shield, player.shield + 50.0)
+			else:
+				player.timers[sk] = 10.0
+			var p_title := String(Game.POWER_NAMES.get(sk, "POTENCIADOR"))
+			fx.add_text(pk.position, p_title, Color("ff9b3d"), 20)
+
+
+func reset_combo() -> void:
+	combo = 1
+	combo_timer = 0.0
+
+
+# ---------------------------------------------------------------- Cámara y efectos
+func add_shake(amount: float) -> void:
+	if bool(Game.settings.shake):
+		shake = minf(26.0, shake + amount)
+
+
+func _step_camera(delta: float) -> void:
+	if not is_instance_valid(player):
+		return
+	var look := (get_global_mouse_position() - player.position) * 0.12
+	if look.length() > 95.0:
+		look = look.normalized() * 95.0
+	var target := player.position + look
+	cam.position = cam.position.lerp(target, clampf(10.0 * delta, 0.0, 1.0))
+	if shake > 0.0:
+		cam.offset = Vector2(randf_range(-shake, shake), randf_range(-shake, shake))
+		shake = maxf(0.0, shake - 42.0 * delta)
+	else:
+		cam.offset = Vector2.ZERO
+
+
+func _flash_screen(col: Color) -> void:
+	if not flash_rect:
+		return
+	flash_rect.color = col
+	var tw := create_tween()
+	tw.tween_property(flash_rect, "color:a", 0.0, 0.35)
+
+
+func _draw() -> void:
+	# Portales de aparición de enemigos
+	for pt in portals:
+		var k := 1.0 - clampf(float(pt.t) / float(pt.m), 0.0, 1.0)
+		var r := lerpf(34.0, 14.0, k)
+		draw_arc(pt.p, r, k * TAU, k * TAU + PI * 1.5, 24, Color(theme_color, 0.8), 3.0)
+		draw_circle(pt.p, 6.0 * k, Color(1, 1, 1, 0.7))
+
+
+# ---------------------------------------------------------------- HUD
+func _build_hud() -> void:
+	hud_layer = CanvasLayer.new()
+	hud_layer.layer = 10
+	add_child(hud_layer)
+
+	flash_rect = ColorRect.new()
+	flash_rect.color = Color(1, 1, 1, 0)
+	flash_rect.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	flash_rect.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	hud_layer.add_child(flash_rect)
+
+	var root := Control.new()
+	root.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	root.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	hud_layer.add_child(root)
+
+	# Esquina superior izquierda: Vida, Escudo, Bombas, Dash
+	var tl := UI.panel(Vector2(290, 0), Color("4df0ff"), 12)
+	tl.position = Vector2(16, 14)
+	root.add_child(tl)
+	var tlv := UI.vbox(6)
+	tl.add_child(tlv)
+
+	var hp_info := _make_bar(Color("4dff88"), "VIDA 100/100")
+	hp_bar = hp_info.fill
+	hp_lbl = hp_info.label
+	tlv.add_child(hp_info.box)
+
+	var sh_info := _make_bar(Color("4d8bff"), "ESCUDO 0/0")
+	sh_bar = sh_info.fill
+	sh_lbl = sh_info.label
+	tlv.add_child(sh_info.box)
+
+	var status_row := UI.hbox(14)
+	bomb_lbl = UI.label("BOMBAS: 2", 16, Color("ff4df0"), HORIZONTAL_ALIGNMENT_LEFT)
+	bomb_lbl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	status_row.add_child(bomb_lbl)
+	dash_lbl = UI.label("DASH: LISTO", 16, Color("4df0ff"), HORIZONTAL_ALIGNMENT_RIGHT)
+	status_row.add_child(dash_lbl)
+	tlv.add_child(status_row)
+
+	power_lbl = UI.label("", 15, Color("ffd24d"), HORIZONTAL_ALIGNMENT_LEFT)
+	tlv.add_child(power_lbl)
+
+	# Parte superior central: Sector / Ronda y barra de jefe
+	var tc := UI.vbox(6)
+	tc.set_anchors_and_offsets_preset(Control.PRESET_TOP_WIDE)
+	tc.offset_left = 340
+	tc.offset_right = -340
+	tc.offset_top = 14
+	tc.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	root.add_child(tc)
+
+	sector_lbl = UI.title("", 24, theme_color)
+	tc.add_child(sector_lbl)
+	wave_lbl = UI.label("", 17, Color(0.85, 0.95, 1.0))
+	tc.add_child(wave_lbl)
+
+	boss_box = UI.panel(Vector2(480, 0), Color("ff4d6a"), 10)
+	boss_box.visible = false
+	var bbv := UI.vbox(4)
+	boss_box.add_child(bbv)
+	boss_name_lbl = UI.label("JEFE", 17, Color("ff4d6a"))
+	bbv.add_child(boss_name_lbl)
+	var b_bar := _make_bar(Color("ff4d6a"), "", 440.0)
+	boss_bar = b_bar.fill
+	bbv.add_child(b_bar.box)
+	tc.add_child(boss_box)
+
+	# Esquina superior derecha: Puntuación, Multiplicador, Créditos, FPS
+	var tr := UI.panel(Vector2(250, 0), Color("ffd24d"), 12)
+	tr.set_anchors_and_offsets_preset(Control.PRESET_TOP_RIGHT)
+	tr.offset_left = -266
+	tr.offset_right = -16
+	tr.offset_top = 14
+	root.add_child(tr)
+	var trv := UI.vbox(4)
+	tr.add_child(trv)
+	score_lbl = UI.label("PUNTOS: 0", 20, Color.WHITE, HORIZONTAL_ALIGNMENT_RIGHT)
+	trv.add_child(score_lbl)
+	combo_lbl = UI.label("COMBO x1", 18, Color("4df0ff"), HORIZONTAL_ALIGNMENT_RIGHT)
+	trv.add_child(combo_lbl)
+	credits_lbl = UI.label("CRÉDITOS: +0 CR", 17, Color("ffd24d"), HORIZONTAL_ALIGNMENT_RIGHT)
+	trv.add_child(credits_lbl)
+	fps_lbl = UI.label("60 FPS", 14, Color(0.65, 0.8, 0.9), HORIZONTAL_ALIGNMENT_RIGHT)
+	trv.add_child(fps_lbl)
+
+	# Centro: Banner de anuncios
+	banner_lbl = UI.title("", 42, theme_color)
+	banner_lbl.set_anchors_and_offsets_preset(Control.PRESET_CENTER)
+	banner_lbl.offset_left = -450
+	banner_lbl.offset_right = 450
+	banner_lbl.offset_top = -170
+	banner_lbl.offset_bottom = -100
+	banner_lbl.modulate.a = 0.0
+	root.add_child(banner_lbl)
+
+	# Parte inferior central: Barra de armas 1-6
+	var hb_wrap := CenterContainer.new()
+	hb_wrap.set_anchors_and_offsets_preset(Control.PRESET_BOTTOM_WIDE)
+	hb_wrap.offset_top = -74
+	hb_wrap.offset_bottom = -12
+	hb_wrap.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	root.add_child(hb_wrap)
+
+	var hb := UI.hbox(8)
+	hb_wrap.add_child(hb)
+	hotbar_btns.clear()
+	for i in Game.WEAPONS.size():
+		var w: Dictionary = Game.WEAPONS[i]
+		var b := UI.button("", func():
+			if is_instance_valid(player):
+				player._select_weapon(i)
+		, 132, 50)
+		b.add_theme_font_size_override("font_size", 14)
+		hb.add_child(b)
+		hotbar_btns.append(b)
+
+	# Esquina inferior derecha: Mini-radar táctico
+	var radar_panel := UI.panel(Vector2(150, 104), Color("4df0ff"), 6)
+	radar_panel.set_anchors_and_offsets_preset(Control.PRESET_BOTTOM_RIGHT)
+	radar_panel.offset_left = -166
+	radar_panel.offset_right = -16
+	radar_panel.offset_top = -120
+	radar_panel.offset_bottom = -16
+	radar_panel.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	root.add_child(radar_panel)
+
+	radar_ctrl = Control.new()
+	radar_ctrl.custom_minimum_size = Vector2(134, 88)
+	radar_ctrl.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	radar_ctrl.draw.connect(_draw_radar)
+	radar_panel.add_child(radar_ctrl)
+
+	# Controles táctiles automáticos para Android / pantallas táctiles
+	touch_controls = TouchControlsScript.new()
+	touch_controls.game = self
+	hud_layer.add_child(touch_controls)
+
+	# Contenedor para cartas tácticas, pausa, victoria y derrota
+	overlay_root = CenterContainer.new()
+	overlay_root.process_mode = Node.PROCESS_MODE_ALWAYS
+	overlay_root.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	overlay_root.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	hud_layer.add_child(overlay_root)
+
+
+func _make_bar(color: Color, txt: String, width: float = 258.0) -> Dictionary:
+	var box := Control.new()
+	box.custom_minimum_size = Vector2(width, 22)
+	var bg_rect := ColorRect.new()
+	bg_rect.color = Color(0.06, 0.08, 0.14, 0.95)
+	bg_rect.size = Vector2(width, 22)
+	box.add_child(bg_rect)
+	var fill := ColorRect.new()
+	fill.color = color
+	fill.size = Vector2(width, 22)
+	box.add_child(fill)
+	var lbl := UI.label(txt, 14, Color.WHITE)
+	lbl.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	lbl.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	box.add_child(lbl)
+	return {"box": box, "fill": fill, "label": lbl}
+
+
+func _update_hud() -> void:
+	if not is_instance_valid(player):
+		return
+	var w := 258.0
+	hp_bar.size.x = w * clampf(player.hp / maxf(1.0, player.max_hp), 0.0, 1.0)
+	hp_lbl.text = "VIDA %d / %d" % [int(ceil(player.hp)), int(player.max_hp)]
+
+	var sh_ratio := clampf(player.shield / maxf(1.0, player.max_shield), 0.0, 1.0) if player.max_shield > 0.0 else 0.0
+	sh_bar.size.x = w * sh_ratio
+	sh_lbl.text = "ESCUDO %d / %d" % [int(ceil(player.shield)), int(player.max_shield)]
+
+	bomb_lbl.text = "BOMBAS EMP: %d" % player.bombs
+	dash_lbl.text = "DASH: LISTO" if player.dash_cd <= 0.05 else "DASH: %.1fs" % player.dash_cd
+
+	var active_powers: Array = []
+	for k in player.timers:
+		if float(player.timers[k]) > 0.0:
+			active_powers.append("%s (%.0fs)" % [String(Game.POWER_NAMES.get(k, k)), float(player.timers[k])])
+	power_lbl.text = "  ".join(active_powers)
+
+	if Game.mode == "campaign":
+		var lvl: Dictionary = Game.LEVELS[Game.current_level]
+		sector_lbl.text = "SECTOR 0%d: %s" % [Game.current_level + 1, String(lvl.name).to_upper()]
+		var hostiles := enemies.size() + portals.size() + spawn_queue.size()
+		wave_lbl.text = "Oleada %d / %d  —  Hostiles: %d" % [maxi(1, wave), max_waves, hostiles]
+	else:
+		sector_lbl.text = "SUPERVIVENCIA — RONDA %d" % maxi(1, wave)
+		var hostiles := enemies.size() + portals.size() + spawn_queue.size()
+		wave_lbl.text = "Hostiles restantes: %d" % hostiles
+
+	if is_instance_valid(boss) and boss.hp > 0.0:
+		boss_box.visible = true
+		boss_name_lbl.text = "%s — %d / %d" % [boss.boss_name, int(ceil(boss.hp)), int(boss.max_hp)]
+		boss_bar.size.x = 440.0 * clampf(boss.hp / maxf(1.0, boss.max_hp), 0.0, 1.0)
+	else:
+		boss_box.visible = false
+
+	score_lbl.text = "PUNTOS: %d" % score
+	combo_lbl.text = "MULTIPLICADOR x%d" % combo
+	combo_lbl.modulate = Color("ffd24d") if combo >= 4 else Color("4df0ff")
+	credits_lbl.text = "CRÉDITOS: +%d CR" % credits_earned
+
+	for i in hotbar_btns.size():
+		var b: Button = hotbar_btns[i]
+		var wep: Dictionary = Game.WEAPONS[i]
+		var unlocked: bool = player.has_weapon(i)
+		var am := int(player.ammo.get(wep.id, 0))
+		var am_txt := "INF" if int(wep.ammo) < 0 else str(am)
+		b.disabled = not unlocked
+		if unlocked:
+			b.text = "[%d] %s (%s)" % [i + 1, String(wep.name).substr(0, 9), am_txt]
+			b.modulate = wep.color.lightened(0.25) if player.weapon_idx == i else Color(0.8, 0.88, 0.95)
+		else:
+			b.text = "[%d] BLOQ." % (i + 1)
+			b.modulate = Color(0.45, 0.45, 0.5)
+
+
+func _draw_radar() -> void:
+	var sz := radar_ctrl.size
+	radar_ctrl.draw_rect(Rect2(Vector2.ZERO, sz), Color(0.02, 0.04, 0.1, 0.85))
+	var scale_v := Vector2(sz.x / arena.size.x, sz.y / arena.size.y)
+	for pk in pickups:
+		if is_instance_valid(pk):
+			radar_ctrl.draw_circle(pk.position * scale_v, 1.8, pk.get_color())
+	for e in enemies:
+		if is_instance_valid(e):
+			radar_ctrl.draw_circle(e.position * scale_v, 2.4, Color("ff4d6a"))
+	if is_instance_valid(boss):
+		radar_ctrl.draw_circle(boss.position * scale_v, 4.5, boss.color)
+	if is_instance_valid(player):
+		radar_ctrl.draw_circle(player.position * scale_v, 3.2, Color("4df0ff"))
+
+
+func _show_banner(txt: String, col: Color) -> void:
+	if not banner_lbl:
+		return
+	banner_lbl.text = txt
+	banner_lbl.add_theme_color_override("font_color", col)
+	banner_lbl.modulate.a = 0.0
+	var tw := create_tween()
+	tw.tween_property(banner_lbl, "modulate:a", 1.0, 0.25)
+	tw.tween_interval(1.6)
+	tw.tween_property(banner_lbl, "modulate:a", 0.0, 0.45)
+
+
+func _clear_overlay() -> void:
+	for c in overlay_root.get_children():
+		c.queue_free()
+	overlay_root.mouse_filter = Control.MOUSE_FILTER_IGNORE
+
+
+# ---------------------------------------------------------------- Cartas tácticas Roguelite
+func _open_card_selection() -> void:
+	choosing_card = true
+	get_tree().paused = true
+	_clear_overlay()
+	overlay_root.mouse_filter = Control.MOUSE_FILTER_STOP
+
+	var p := UI.panel(Vector2(860, 0), Color("4df0ff"), 24)
+	var v := UI.vbox(16)
+	v.alignment = BoxContainer.ALIGNMENT_CENTER
+	p.add_child(v)
+
+	v.add_child(UI.title("MEJORA TÁCTICA DE COMBATE", 34, Color("4df0ff")))
+	v.add_child(UI.label("Elige 1 módulo de mejora para tu nave", 18, Color(0.8, 0.9, 1.0)))
+
+	var pool := Game.CARDS.duplicate()
+	pool.shuffle()
+	var row := UI.hbox(18)
+	row.alignment = BoxContainer.ALIGNMENT_CENTER
+	v.add_child(row)
+
+	var first_btn: Button = null
+	for i in 3:
+		var c: Dictionary = pool[i]
+		var card_panel := UI.panel(Vector2(250, 230), c.color, 16)
+		var cv := UI.vbox(10)
+		cv.alignment = BoxContainer.ALIGNMENT_CENTER
+		card_panel.add_child(cv)
+
+		cv.add_child(UI.title("[%s]" % String(c.icon), 30, c.color))
+		cv.add_child(UI.label(String(c.name), 20, Color.WHITE))
+		cv.add_child(UI.wrap_label(String(c.desc), 15, 215, Color(0.82, 0.9, 0.98), HORIZONTAL_ALIGNMENT_CENTER))
+		var sp := Control.new()
+		sp.size_flags_vertical = Control.SIZE_EXPAND_FILL
+		cv.add_child(sp)
+
+		var pick_btn := UI.button("INSTALAR", func():
+			Sfx.play("powerup")
+			player.apply_card(String(c.id))
+			choosing_card = false
+			_clear_overlay()
+			get_tree().paused = false
+			_start_next_wave()
+		, 210, 42)
+		if first_btn == null:
+			first_btn = pick_btn
+		cv.add_child(pick_btn)
+		row.add_child(card_panel)
+
+	overlay_root.add_child(p)
+	if first_btn:
+		first_btn.grab_focus.call_deferred()
+
+
+# ---------------------------------------------------------------- Menú de Pausa
+func _toggle_pause() -> void:
+	if get_tree().paused:
+		_clear_overlay()
+		get_tree().paused = false
+		return
+
+	get_tree().paused = true
+	_show_pause_main()
+
+
+func _show_pause_main() -> void:
+	_clear_overlay()
+	overlay_root.mouse_filter = Control.MOUSE_FILTER_STOP
+	var p := UI.panel(Vector2(420, 0), Color("4df0ff"), 24)
+	var v := UI.vbox(12)
+	v.alignment = BoxContainer.ALIGNMENT_CENTER
+	p.add_child(v)
+
+	v.add_child(UI.title("JUEGO EN PAUSA", 38, Color("4df0ff")))
+	var resume := UI.button("CONTINUAR MISIÓN", _toggle_pause, 340, 46)
+	v.add_child(resume)
+	v.add_child(UI.button("REINICIAR MISIÓN", func():
+		Game.save_game()
+		Game.change_scene("res://scenes/game.tscn")
+	, 340, 46))
+	v.add_child(UI.button("OPCIONES", _show_pause_options, 340, 46))
+	v.add_child(UI.button("VOLVER AL MENÚ PRINCIPAL", func():
+		Game.save_game()
+		Game.change_scene("res://scenes/main_menu.tscn")
+	, 340, 46))
+
+	overlay_root.add_child(p)
+	resume.grab_focus.call_deferred()
+
+
+func _show_pause_options() -> void:
+	_clear_overlay()
+	overlay_root.mouse_filter = Control.MOUSE_FILTER_STOP
+	var p := UI.panel(Vector2(660, 0), Color("4df0ff"), 24)
+	var opt := OptionsPanel.new()
+	opt.closed.connect(_show_pause_main)
+	p.add_child(opt)
+	overlay_root.add_child(p)
+
+
+# ---------------------------------------------------------------- Victoria y Derrota
+func _on_campaign_victory() -> void:
+	if match_ended:
+		return
+	match_ended = true
+	get_tree().paused = true
+	Sfx.play("victory")
+
+	var lvl: Dictionary = Game.LEVELS[Game.current_level]
+	var reward := int(round(float(lvl.reward) * float(Game.difficulty().credits)))
+	credits_earned += reward
+	Game.add_credits(reward)
+
+	var stars := 1
+	if is_instance_valid(player) and player.hp >= player.max_hp * 0.5:
+		stars = 2
+	if not took_damage_this_sector or (is_instance_valid(player) and player.hp >= player.max_hp * 0.85):
+		stars = 3
+
+	if not took_damage_this_sector:
+		Game.unlock_achievement("perfect")
+	if int(Game.settings.difficulty) == 3:
+		Game.unlock_achievement("nightmare")
+
+	var prev_stars := int(Game.data.stars.get(Game.current_level, 0))
+	Game.data.stars[Game.current_level] = maxi(prev_stars, stars)
+
+	var prev_best := int(Game.data.best.get(Game.current_level, 0))
+	Game.data.best[Game.current_level] = maxi(prev_best, score)
+
+	if Game.current_level >= int(Game.data.unlocked_level) and Game.current_level < Game.LEVELS.size() - 1:
+		Game.data.unlocked_level = Game.current_level + 1
+	if Game.current_level == Game.LEVELS.size() - 1:
+		Game.data.campaign_done = true
+
+	var unlocked_wep_name := ""
+	if String(lvl.unlock) != "" and not Game.data.weapons.has(String(lvl.unlock)):
+		Game.unlock_weapon(String(lvl.unlock))
+		for w in Game.WEAPONS:
+			if w.id == lvl.unlock:
+				unlocked_wep_name = String(w.name)
+
+	Game.save_game()
+
+	_clear_overlay()
+	overlay_root.mouse_filter = Control.MOUSE_FILTER_STOP
+	var p := UI.panel(Vector2(540, 0), Color("4dff88"), 26)
+	var v := UI.vbox(12)
+	v.alignment = BoxContainer.ALIGNMENT_CENTER
+	p.add_child(v)
+
+	v.add_child(UI.title("¡SECTOR COMPLETADO!", 42, Color("4dff88")))
+	v.add_child(UI.label("Sector 0%d — %s" % [Game.current_level + 1, String(lvl.name)], 20, theme_color))
+
+	var st_wrap := CenterContainer.new()
+	st_wrap.add_child(UI.stars_widget(stars, 3, 34.0))
+	v.add_child(st_wrap)
+
+	v.add_child(UI.label("Puntuación final: %d pts" % score, 22, Color.WHITE))
+	v.add_child(UI.label("Hostiles eliminados: %d" % kills, 18, Color(0.8, 0.9, 1.0)))
+	v.add_child(UI.label("Créditos obtenidos: +%d CR (Total: %d CR)" % [credits_earned, int(Game.data.credits)], 20, Color("ffd24d")))
+
+	if unlocked_wep_name != "":
+		v.add_child(UI.label("¡NUEVA ARMA DESBLOQUEADA: %s!" % unlocked_wep_name.to_upper(), 20, Color("7dff6b")))
+
+	v.add_child(UI.spacer(6))
+	var first_btn: Button = null
+	if Game.current_level < Game.LEVELS.size() - 1:
+		first_btn = UI.button("SIGUIENTE SECTOR", func():
+			Game.current_level += 1
+			Game.change_scene("res://scenes/game.tscn")
+		, 360, 48)
+		v.add_child(first_btn)
+
+	var retry := UI.button("REPETIR SECTOR", func():
+		Game.change_scene("res://scenes/game.tscn")
+	, 360, 44)
+	if first_btn == null:
+		first_btn = retry
+	v.add_child(retry)
+
+	v.add_child(UI.button("VOLVER AL MENÚ PRINCIPAL", func():
+		Game.change_scene("res://scenes/main_menu.tscn")
+	, 360, 44))
+
+	overlay_root.add_child(p)
+	first_btn.grab_focus.call_deferred()
+
+
+func on_player_died() -> void:
+	if match_ended:
+		return
+	match_ended = true
+	Sfx.play("big_explosion")
+	Sfx.play("gameover")
+	fx.add_burst(player.position, Color("4df0ff"), 50, 400.0, 5.0, 0.9)
+	fx.add_ring(player.position, Color("ff4d6a"), 240.0, 0.65, 6.0)
+	player.visible = false
+
+	var rank := -1
+	if Game.mode == "survival":
+		rank = Game.add_survival_score(score, maxi(1, wave))
+	Game.save_game()
+
+	get_tree().paused = true
+	_clear_overlay()
+	overlay_root.mouse_filter = Control.MOUSE_FILTER_STOP
+
+	var p := UI.panel(Vector2(520, 0), Color("ff4d6a"), 26)
+	var v := UI.vbox(12)
+	v.alignment = BoxContainer.ALIGNMENT_CENTER
+	p.add_child(v)
+
+	v.add_child(UI.title("NAVE DESTRUIDA", 44, Color("ff4d6a")))
+	if Game.mode == "survival":
+		v.add_child(UI.label("Alcanzaste la Ronda %d en Supervivencia" % maxi(1, wave), 20, Color("ff4df0")))
+		if rank >= 0 and rank < 5:
+			v.add_child(UI.label("¡NUEVO RÉCORD PERSONAL (#%d)!" % (rank + 1), 20, Color("ffd24d")))
+	else:
+		var lvl: Dictionary = Game.LEVELS[Game.current_level]
+		v.add_child(UI.label("Sector 0%d: %s — Oleada %d / %d" % [Game.current_level + 1, String(lvl.name), maxi(1, wave), max_waves], 19, theme_color))
+
+	v.add_child(UI.label("Puntuación: %d pts" % score, 22, Color.WHITE))
+	v.add_child(UI.label("Hostiles eliminados: %d" % kills, 18, Color(0.8, 0.9, 1.0)))
+	v.add_child(UI.label("Créditos asegurados: +%d CR" % credits_earned, 20, Color("ffd24d")))
+	v.add_child(UI.spacer(6))
+
+	var retry := UI.button("REINTENTAR MISIÓN", func():
+		Game.change_scene("res://scenes/game.tscn")
+	, 360, 48)
+	v.add_child(retry)
+
+	v.add_child(UI.button("VOLVER AL MENÚ / HANGAR", func():
+		Game.change_scene("res://scenes/main_menu.tscn")
+	, 360, 46))
+
+	overlay_root.add_child(p)
+	retry.grab_focus.call_deferred()

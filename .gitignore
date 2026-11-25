@@ -1,0 +1,14 @@
+# Godot 4+ ignore
+.godot/
+*.translation
+
+# Binarios pesados (disponibles localmente en build/ y en GitHub Releases)
+build/windows/*.exe
+build/android/*.apk
+
+# Claves privadas y certificados de firma
+*.keystore
+*.jks
+*.key
+*.pem
+export_credentials.cfg
