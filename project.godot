@@ -1,19 +1,26 @@
 ; Engine configuration file.
-; Neon Strike: Asalto Galáctico
+; It's best edited using the editor UI and not directly,
+; since the parameters that go here are not all obvious.
+;
+; Format:
+;   [section] ; section goes between []
+;   param=value ; assign values to parameters
 
 config_version=5
+
+[animation]
+
+compatibility/default_parent_skeleton_in_mesh_instance_3d=true
 
 [application]
 
 config/name="Neon Strike: Asalto Galáctico"
 config/description="Shooter 2D de campaña y supervivencia por rondas."
-config/version="1.0.0"
+config/version="1.1.0"
 run/main_scene="res://scenes/main_menu.tscn"
-config/features=PackedStringArray("4.3", "GL Compatibility")
+config/features=PackedStringArray("4.7", "GL Compatibility")
 boot_splash/bg_color=Color(0.02, 0.02, 0.08, 1)
 boot_splash/image="res://assets/splash.png"
-boot_splash/fullsize=true
-boot_splash/use_filter=true
 config/icon="res://assets/icon.png"
 config/windows_native_icon="res://assets/icon.ico"
 
@@ -28,12 +35,7 @@ window/size/viewport_width=1280
 window/size/viewport_height=720
 window/stretch/mode="canvas_items"
 window/stretch/aspect="expand"
-window/handheld/orientation=0
-
-[input_devices]
-
-pointing/emulate_touch_from_mouse=false
-pointing/emulate_mouse_from_touch=true
+window/handheld/orientation=4
 
 [rendering]
 

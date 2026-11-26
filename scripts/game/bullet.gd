@@ -23,10 +23,10 @@ func _ready() -> void:
 func step(delta: float) -> bool:
 	prev_pos = position
 	if homing > 0.0 and not is_enemy and game:
-		var target: Node2D = game.find_nearest_hostile(position, 650.0)
+		var target: Node2D = game.find_nearest_hostile(position, 720.0)
 		if target:
 			var desired: Vector2 = (target.position - position).normalized() * vel.length()
-			vel = vel.lerp(desired, clampf(homing * delta, 0.0, 1.0)).normalized() * vel.length()
+			vel = vel.lerp(desired, clampf(homing * 1.15 * delta, 0.0, 1.0)).normalized() * vel.length()
 	position += vel * delta
 	rotation = vel.angle()
 	life -= delta

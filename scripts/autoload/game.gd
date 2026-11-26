@@ -6,7 +6,7 @@ const LEGACY_SAVE_PATH := "user://neon_strike_save.cfg"
 const _SECURITY_SALT := "NEON_STRIKE_GALACTIC_ASSAULT_V1_HMAC_KEY_9F4A2C"
 const TITLE := "NEON STRIKE"
 const SUBTITLE := "ASALTO GALÁCTICO"
-const VERSION := "v1.0"
+const VERSION := "v1.1"
 
 const DIFFICULTIES := [
 	{"name": "Recluta", "hp": 0.7, "dmg": 0.6, "score": 0.7, "credits": 0.8, "color": Color("4dff88")},
@@ -89,6 +89,7 @@ const ACHIEVEMENTS := [
 var settings := {
 	"master": 0.8, "music": 0.6, "sfx": 0.8,
 	"fullscreen": false, "shake": true, "damage_numbers": true, "show_fps": false,
+	"auto_aim": true, "haptics": true, "touch_opacity": 0.78,
 	"pilot": "PILOTO", "difficulty": 1,
 }
 var data := {}
@@ -98,8 +99,47 @@ var title_font: Font
 var ui_theme: Theme
 
 var _fade: ColorRect
+var _fade_tween: Tween
 var _toast_box: VBoxContainer
+var _ui_script: Script
 var _busy := false
+
+
+func is_mobile() -> bool:
+	return OS.get_name() in ["Android", "iOS"] or OS.has_feature("mobile")
+
+
+func haptic(ms: int) -> void:
+	if is_mobile() and bool(settings.get("haptics", true)):
+		Input.vibrate_handheld(ms)
+
+
+func get_safe_insets() -> Dictionary:
+	var zero := {"left": 0.0, "right": 0.0, "top": 0.0, "bottom": 0.0}
+	if not is_mobile():
+		return zero
+	var win_size := Vector2(DisplayServer.window_get_size())
+	var vp := get_viewport()
+	if not vp or win_size.x <= 0.0 or win_size.y <= 0.0:
+		return zero
+	var vp_size := vp.get_visible_rect().size
+	var safe := DisplayServer.get_display_safe_area()
+	if safe.size.x <= 0 or safe.size.y <= 0:
+		return zero
+	var sx := vp_size.x / win_size.x
+	var sy := vp_size.y / win_size.y
+	return {
+		"left": clampf(float(safe.position.x) * sx, 0.0, 96.0),
+		"top": clampf(float(safe.position.y) * sy, 0.0, 64.0),
+		"right": clampf(maxf(0.0, win_size.x - float(safe.end.x)) * sx, 0.0, 96.0),
+		"bottom": clampf(maxf(0.0, win_size.y - float(safe.end.y)) * sy, 0.0, 64.0),
+	}
+
+
+func _notification(what: int) -> void:
+	if what == NOTIFICATION_APPLICATION_PAUSED or what == NOTIFICATION_WM_CLOSE_REQUEST:
+		if not data.is_empty():
+			save_game()
 
 
 func _ready() -> void:
@@ -130,6 +170,7 @@ func _ready() -> void:
 	_toast_box.offset_top = 20
 	_toast_box.add_theme_constant_override("separation", 8)
 	layer.add_child(_toast_box)
+	_ui_script = load("res://scripts/ui.gd")
 	apply_settings()
 
 
@@ -185,6 +226,9 @@ func _sanitize_state() -> void:
 	settings.shake = bool(settings.get("shake", true))
 	settings.damage_numbers = bool(settings.get("damage_numbers", true))
 	settings.show_fps = bool(settings.get("show_fps", false))
+	settings.auto_aim = bool(settings.get("auto_aim", true))
+	settings.haptics = bool(settings.get("haptics", true))
+	settings.touch_opacity = clampf(float(settings.get("touch_opacity", 0.78)), 0.35, 1.0)
 	settings.pilot = sanitize_pilot_name(String(settings.get("pilot", "PILOTO")))
 	settings.difficulty = clampi(int(settings.get("difficulty", 1)), 0, DIFFICULTIES.size() - 1)
 
@@ -246,6 +290,23 @@ func _sanitize_state() -> void:
 			if v > 0:
 				clean_best[i] = clampi(v, 0, 99999999)
 	data.best = clean_best
+
+	# Validar puntuaciones de Supervivencia
+	var clean_scores: Array = []
+	var raw_scores = data.get("survival_scores", [])
+	if raw_scores is Array:
+		for entry in raw_scores:
+			if entry is Dictionary:
+				clean_scores.append({
+					"name": sanitize_pilot_name(String(entry.get("name", "PILOTO"))),
+					"score": clampi(int(entry.get("score", 0)), 0, 99999999),
+					"round": clampi(int(entry.get("round", 1)), 1, 9999),
+					"diff": clampi(int(entry.get("diff", 1)), 0, DIFFICULTIES.size() - 1),
+				})
+	clean_scores.sort_custom(func(a, b): return int(a.score) > int(b.score))
+	if clean_scores.size() > 10:
+		clean_scores.resize(10)
+	data.survival_scores = clean_scores
 
 	# Validar estadísticas
 	var defaults: Dictionary = _default_data().stats
@@ -343,13 +404,14 @@ func weapon_unlocked(i: int) -> bool:
 	return data.weapons.has(String(WEAPONS[i].id))
 
 
-func unlock_weapon(id: String) -> void:
+func unlock_weapon(id: String, show_toast: bool = true) -> void:
 	if data.weapons.has(id):
 		return
 	data.weapons.append(id)
-	for w in WEAPONS:
-		if w.id == id:
-			toast("NUEVA ARMA DESBLOQUEADA", String(w.name), w.color)
+	if show_toast:
+		for w in WEAPONS:
+			if w.id == id:
+				toast("NUEVA ARMA DESBLOQUEADA", String(w.name), w.color, String(w.desc), "weapon")
 	if data.weapons.size() >= WEAPONS.size():
 		unlock_achievement("arsenal")
 	save_game()
@@ -371,8 +433,9 @@ func unlock_achievement(id: String) -> void:
 	data.achievements.append(id)
 	for a in ACHIEVEMENTS:
 		if a.id == id:
-			toast("LOGRO DESBLOQUEADO", String(a.name), Color("ffd24d"))
+			toast("LOGRO DESBLOQUEADO", String(a.name), Color("ffd24d"), String(a.desc), "trophy")
 	Sfx.play("achievement")
+	haptic(45)
 	save_game()
 
 
@@ -395,8 +458,10 @@ func apply_settings() -> void:
 	_set_bus("Master", float(settings.master))
 	_set_bus("Music", float(settings.music))
 	_set_bus("SFX", float(settings.sfx))
+	if is_mobile() or DisplayServer.get_name() == "headless":
+		return
 	var want := DisplayServer.WINDOW_MODE_FULLSCREEN if settings.fullscreen else DisplayServer.WINDOW_MODE_WINDOWED
-	if DisplayServer.get_name() != "headless" and DisplayServer.window_get_mode() != want:
+	if DisplayServer.window_get_mode() != want:
 		if want == DisplayServer.WINDOW_MODE_WINDOWED and DisplayServer.window_get_mode() == DisplayServer.WINDOW_MODE_MAXIMIZED:
 			return
 		DisplayServer.window_set_mode(want)
@@ -415,46 +480,130 @@ func change_scene(path: String) -> void:
 	if _busy:
 		return
 	_busy = true
-	var t := create_tween()
-	t.tween_property(_fade, "color:a", 1.0, 0.25)
-	await t.finished
+	if _fade_tween and _fade_tween.is_valid():
+		_fade_tween.kill()
+	_fade_tween = create_tween()
+	_fade_tween.set_pause_mode(Tween.TWEEN_PAUSE_PROCESS)
+	_fade_tween.tween_property(_fade, "color:a", 1.0, 0.22)
+	await _fade_tween.finished
 	get_tree().paused = false
 	Engine.time_scale = 1.0
 	get_tree().change_scene_to_file(path)
 	await get_tree().process_frame
 	await get_tree().process_frame
-	var t2 := create_tween()
-	t2.tween_property(_fade, "color:a", 0.0, 0.3)
+	_fade_tween = create_tween()
+	_fade_tween.set_pause_mode(Tween.TWEEN_PAUSE_PROCESS)
+	_fade_tween.tween_property(_fade, "color:a", 0.0, 0.26)
 	_busy = false
 
 
-func toast(title: String, sub: String, color: Color = Color("4df0ff")) -> void:
+func toast(title: String, sub: String, color: Color = Color("4df0ff"), detail: String = "", icon_kind: String = "info") -> void:
+	if not is_instance_valid(_toast_box):
+		return
+	var insets := get_safe_insets()
+	var compact := is_mobile()
+	var toast_w := 340.0 if compact else 400.0
+	_toast_box.offset_left = -toast_w - 16.0 - float(insets.right)
+	_toast_box.offset_right = -16.0 - float(insets.right)
+	_toast_box.offset_top = (60.0 if compact else 64.0) + float(insets.top)
+
+	# Limitar pila simultánea para que nunca invada la pantalla
+	while _toast_box.get_child_count() >= 3:
+		var oldest := _toast_box.get_child(0)
+		_toast_box.remove_child(oldest)
+		oldest.queue_free()
+
 	var p := PanelContainer.new()
+	p.custom_minimum_size = Vector2(toast_w, 0)
 	var sb := StyleBoxFlat.new()
-	sb.bg_color = Color(0.03, 0.05, 0.12, 0.95)
+	sb.bg_color = Color(0.03, 0.05, 0.13, 0.96)
 	sb.border_color = color
-	sb.set_border_width_all(2)
-	sb.set_corner_radius_all(8)
-	sb.set_content_margin_all(12)
+	sb.border_width_left = 5
+	sb.border_width_top = 1
+	sb.border_width_right = 2
+	sb.border_width_bottom = 1
+	sb.set_corner_radius_all(10)
+	sb.content_margin_left = 12
+	sb.content_margin_right = 14
+	sb.content_margin_top = 9 if compact else 11
+	sb.content_margin_bottom = 7 if compact else 9
+	sb.shadow_color = Color(color, 0.35)
+	sb.shadow_size = 14
 	p.add_theme_stylebox_override("panel", sb)
 	p.mouse_filter = Control.MOUSE_FILTER_IGNORE
+
+	var outer := VBoxContainer.new()
+	outer.add_theme_constant_override("separation", 6)
+	outer.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	p.add_child(outer)
+
+	var row := HBoxContainer.new()
+	row.add_theme_constant_override("separation", 11)
+	row.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	outer.add_child(row)
+
+	var badge: Control = _ui_script.icon_badge(icon_kind, color, 36.0 if compact else 42.0, true) if _ui_script else Control.new()
+	row.add_child(badge)
+
 	var v := VBoxContainer.new()
-	p.add_child(v)
+	v.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	v.add_theme_constant_override("separation", 1)
+	v.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	row.add_child(v)
+
 	var l1 := Label.new()
-	l1.text = title
-	l1.add_theme_font_size_override("font_size", 14)
-	l1.add_theme_color_override("font_color", color)
+	l1.text = title.to_upper()
+	l1.add_theme_font_size_override("font_size", 11 if compact else 12)
+	l1.add_theme_color_override("font_color", color.lightened(0.15))
+	l1.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	v.add_child(l1)
+
 	var l2 := Label.new()
 	l2.text = sub
-	l2.add_theme_font_size_override("font_size", 22)
+	l2.add_theme_font_size_override("font_size", 16 if compact else 18)
+	l2.add_theme_color_override("font_color", Color.WHITE)
+	l2.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	l2.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	v.add_child(l2)
+
+	if detail != "":
+		var l3 := Label.new()
+		l3.text = detail
+		l3.add_theme_font_size_override("font_size", 12 if compact else 13)
+		l3.add_theme_color_override("font_color", Color(0.76, 0.88, 0.98))
+		l3.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+		l3.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		v.add_child(l3)
+
+	# Barra animada de duración restante en la parte inferior de la notificación
+	var bar_bg := ColorRect.new()
+	bar_bg.custom_minimum_size = Vector2(0, 3)
+	bar_bg.color = Color(1, 1, 1, 0.1)
+	bar_bg.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	outer.add_child(bar_bg)
+
+	var bar_fill := ColorRect.new()
+	bar_fill.color = color
+	bar_fill.anchor_right = 1.0
+	bar_fill.anchor_bottom = 1.0
+	bar_fill.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	bar_bg.add_child(bar_fill)
+
 	_toast_box.add_child(p)
+	var hold := 3.0 if compact else 3.4
 	p.modulate.a = 0.0
+	p.position.x = 60.0
 	var tw := p.create_tween()
-	tw.tween_property(p, "modulate:a", 1.0, 0.25)
-	tw.tween_interval(3.0)
-	tw.tween_property(p, "modulate:a", 0.0, 0.4)
+	tw.set_pause_mode(Tween.TWEEN_PAUSE_PROCESS)
+	tw.set_parallel(true)
+	tw.tween_property(p, "modulate:a", 1.0, 0.24)
+	tw.tween_property(p, "position:x", 0.0, 0.30).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
+	tw.set_parallel(false)
+	tw.tween_property(bar_fill, "anchor_right", 0.0, hold).set_trans(Tween.TRANS_LINEAR)
+	tw.set_parallel(true)
+	tw.tween_property(p, "modulate:a", 0.0, 0.32)
+	tw.tween_property(p, "position:x", 45.0, 0.32).set_trans(Tween.TRANS_QUAD).set_ease(Tween.EASE_IN)
+	tw.set_parallel(false)
 	tw.tween_callback(p.queue_free)
 
 

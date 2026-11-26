@@ -19,6 +19,7 @@ var dash_vel := Vector2.ZERO
 var laser_angle := 0.0
 var laser_charging := 0.0
 var laser_active := 0.0
+var _reina_spawned := false
 
 
 func setup(g: Node2D, k: String, scale_mult: float = 1.0) -> void:
@@ -53,6 +54,7 @@ func step(delta: float) -> bool:
 	if phase == 1 and hp <= max_hp * 0.5:
 		phase = 2
 		Sfx.play("boss_warn")
+		Game.haptic(60)
 		game.add_shake(12.0)
 		game.fx.add_ring(position, color, 220.0, 0.55, 6.0)
 		game.fx.add_text(position + Vector2(0, -radius - 20), "¡FASE 2 ACTIVADA!", color, 24)
@@ -69,9 +71,11 @@ func step(delta: float) -> bool:
 	if pattern_t >= 5.5:
 		pattern_t = 0.0
 		pattern = (pattern + 1) % 3
+		_reina_spawned = false
+		laser_charging = 0.0
+		laser_active = 0.0
 		if kind == "omega" and pattern == 2:
 			laser_charging = 1.2
-			laser_active = 0.0
 			laser_angle = dir.angle()
 			Sfx.play("charge")
 
@@ -143,7 +147,8 @@ func _step_reina(delta: float, dir: Vector2, dmg_m: float, rate_m: float) -> voi
 				var a := t * 3.8 + k * TAU / 3.0
 				var bdir := Vector2(cos(a), sin(a))
 				game.spawn_bullet(position + bdir * 35.0, bdir * 380.0, 15.0 * dmg_m, color, 6.0, 3.0, true)
-		if int(pattern_t * 10.0) == 15 and game.enemies.size() < 14:
+		if not _reina_spawned and pattern_t >= 1.5 and game.enemies.size() < 14:
+			_reina_spawned = true
 			for i in (2 if phase == 1 else 3):
 				var off := Vector2.RIGHT.rotated(randf() * TAU) * 85.0
 				game.spawn_enemy("mini" if i % 2 == 0 else "kamikaze", position + off)

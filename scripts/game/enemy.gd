@@ -19,6 +19,7 @@ var sniper_aim := 0.0
 var locked_dir := Vector2.RIGHT
 var orbit_sign := 1.0
 var wobble := 0.0
+var knockback := Vector2.ZERO
 
 
 func setup(g: Node2D, k: String, scale_mult: float = 1.0) -> void:
@@ -180,28 +181,41 @@ func step(delta: float) -> bool:
 					locked_dir = dir
 					Sfx.play("charge", -6.0)
 
+	if knockback.length_squared() > 1.0:
+		position += knockback * delta
+		knockback = knockback.move_toward(Vector2.ZERO, 950.0 * delta)
+
 	var bounds: Rect2 = game.arena.grow(-radius)
 	position.x = clampf(position.x, bounds.position.x, bounds.end.x)
 	position.y = clampf(position.y, bounds.position.y, bounds.end.y)
 
 	if position.distance_to(p.position) <= radius + p.radius:
-		p.take_damage(contact_dmg, self)
-		if kind == "kamikaze":
-			game.fx.add_ring(position, color, 85.0, 0.3, 4.0)
-			hp = 0.0
-			return false
-		else:
-			position -= dir * 24.0
+		if p.dash_time <= 0.0:
+			p.take_damage(contact_dmg, self)
+			if kind == "kamikaze":
+				Sfx.play("explosion", -3.0)
+				game.add_shake(5.0)
+				game.fx.add_ring(position, color, 85.0, 0.3, 4.0)
+				game.fx.add_burst(position, color, 16, 260.0, 3.6, 0.45)
+				hp = 0.0
+				return false
+			else:
+				position -= dir * 24.0
 
 	queue_redraw()
 	return hp > 0.0
 
 
-func take_damage(amount: float, is_crit: bool = false) -> void:
+func take_damage(amount: float, is_crit: bool = false, impulse: Vector2 = Vector2.ZERO) -> void:
 	if hp <= 0.0:
 		return
 	hp -= amount
 	hit_flash = 0.1
+	if impulse.length_squared() > 0.0:
+		var mass := 2.4 if kind == "tank" else (1.4 if kind == "splitter" else 1.0)
+		knockback += impulse / mass
+		if knockback.length() > 360.0:
+			knockback = knockback.normalized() * 360.0
 	Sfx.play("hit", -7.0)
 	if Game.settings.damage_numbers:
 		var col := Color("ffd24d") if is_crit else Color.WHITE

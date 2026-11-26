@@ -29,7 +29,12 @@ func _ready() -> void:
 	_slider(grid, "Volumen general", "master")
 	_slider(grid, "Música", "music")
 	_slider(grid, "Efectos de sonido", "sfx")
-	_check(grid, "Pantalla completa", "fullscreen")
+	if Game.is_mobile():
+		_check(grid, "Auto-apuntado táctil", "auto_aim")
+		_check(grid, "Vibración háptica", "haptics")
+		_slider_range(grid, "Opacidad controles", "touch_opacity", 0.35, 1.0, 0.05)
+	else:
+		_check(grid, "Pantalla completa", "fullscreen")
 	_check(grid, "Vibración de pantalla", "shake")
 	_check(grid, "Números de daño", "damage_numbers")
 	_check(grid, "Mostrar FPS", "show_fps")
@@ -42,13 +47,17 @@ func _ready() -> void:
 
 
 func _slider(grid: GridContainer, text: String, key: String) -> void:
+	_slider_range(grid, text, key, 0.0, 1.0, 0.05)
+
+
+func _slider_range(grid: GridContainer, text: String, key: String, min_v: float, max_v: float, step_v: float) -> void:
 	grid.add_child(UI.label(text, 20, Color(0.8, 0.9, 1.0), HORIZONTAL_ALIGNMENT_LEFT))
 	var h := UI.hbox(10)
 	var s := HSlider.new()
-	s.min_value = 0.0
-	s.max_value = 1.0
-	s.step = 0.05
-	s.value = float(Game.settings[key])
+	s.min_value = min_v
+	s.max_value = max_v
+	s.step = step_v
+	s.value = clampf(float(Game.settings.get(key, max_v)), min_v, max_v)
 	s.custom_minimum_size = Vector2(230, 30)
 	s.size_flags_vertical = Control.SIZE_SHRINK_CENTER
 	var pct := UI.label("%d%%" % int(round(s.value * 100.0)), 18)
@@ -57,7 +66,7 @@ func _slider(grid: GridContainer, text: String, key: String) -> void:
 		Game.settings[key] = v
 		pct.text = "%d%%" % int(round(v * 100.0))
 		Game.apply_settings()
-		if key != "music":
+		if key != "music" and key != "touch_opacity":
 			Sfx.play("coin")
 	)
 	h.add_child(s)

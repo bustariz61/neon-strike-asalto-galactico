@@ -13,6 +13,7 @@ var _wanted := ""
 var _playing := ""
 var _thread: Thread
 var _last_play := {}
+var _music_tween: Tween
 
 
 func _ready() -> void:
@@ -77,14 +78,16 @@ func stop_music() -> void:
 
 func _switch_music() -> void:
 	_playing = _wanted
+	if _music_tween and _music_tween.is_valid():
+		_music_tween.kill()
 	if _wanted == "":
 		_music.stop()
 		return
 	_music.stream = _tracks[_wanted]
 	_music.volume_db = -30.0
 	_music.play()
-	var tw := create_tween()
-	tw.tween_property(_music, "volume_db", -4.0, 1.2)
+	_music_tween = create_tween()
+	_music_tween.tween_property(_music, "volume_db", -4.0, 1.2)
 
 
 # ---------------------------------------------------------------- Efectos
@@ -203,6 +206,13 @@ func _build_music() -> void:
 	call_deferred("_on_track_ready", "battle", battle)
 	var boss := _render_track(rng, 152.0, [[40, 43, 47], [36, 40, 43], [38, 42, 45], [35, 39, 42]], 32, 2, true, true, 0.06, 0.028, 0.15)
 	call_deferred("_on_track_ready", "boss", boss)
+	call_deferred("_finish_music_thread")
+
+
+func _finish_music_thread() -> void:
+	if _thread and _thread.is_started():
+		_thread.wait_to_finish()
+		_thread = null
 
 
 func _on_track_ready(track: String, stream: AudioStreamWAV) -> void:

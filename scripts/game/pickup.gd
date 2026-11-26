@@ -8,6 +8,7 @@ var value := 15
 var life := 14.0
 var t := 0.0
 var radius := 14.0
+var force_pull := false
 
 
 func _ready() -> void:
@@ -25,7 +26,9 @@ func step(delta: float) -> bool:
 		if kind == "credit":
 			mag_r *= 1.35
 		var d := position.distance_to(p.position)
-		if d < mag_r:
+		if force_pull:
+			position = position.move_toward(p.position, 960.0 * delta)
+		elif d < mag_r:
 			var pull := lerpf(720.0, 260.0, clampf(d / mag_r, 0.0, 1.0))
 			position = position.move_toward(p.position, pull * delta)
 		if d <= p.radius + radius + 6.0:

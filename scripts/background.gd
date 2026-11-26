@@ -16,7 +16,8 @@ func _ready() -> void:
 	rng.randomize()
 	var bounds := area.grow(700)
 	if menu_mode:
-		bounds = Rect2(Vector2.ZERO, get_viewport_rect().size)
+		var vp := get_viewport_rect().size
+		bounds = Rect2(Vector2.ZERO, Vector2(maxf(vp.x, 1920.0), maxf(vp.y, 1080.0)))
 	var count := 220 if menu_mode else 700
 	for i in count:
 		stars.append({
